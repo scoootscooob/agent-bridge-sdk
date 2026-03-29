@@ -15,11 +15,7 @@
  *         Simulated here with random values for demo purposes.
  */
 
-#include <WiFi.h>
 #include <agent_bridge.h>
-
-const char* WIFI_SSID     = "your-wifi-ssid";
-const char* WIFI_PASSWORD = "your-wifi-password";
 
 static float current_temp = 22.0;
 static unsigned long last_read_ms = 0;
@@ -48,20 +44,12 @@ float read_temperature() {
 void setup() {
     Serial.begin(115200);
 
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
-
-    // --- Build the manifest ---
     static ahp_config_t config = {};
     config.device_id = "esp32-sensor-01";
     config.label = "ESP32 Temperature Sensor";
     config.firmware = "1.0.0";
-    config.gateway_url = NULL;  // Auto-discover gateway via mDNS
+    config.gateway_url = NULL;
+    config.wifi_mode = AHP_WIFI_AUTO;
     config.on_read = on_read;
 
     ahp_resource_t* sensor = &config.manifest.resources[0];

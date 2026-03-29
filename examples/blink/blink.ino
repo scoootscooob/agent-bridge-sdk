@@ -13,11 +13,8 @@
  * Wiring: LED on GPIO 2 (built-in on most ESP32 boards).
  */
 
-#include <WiFi.h>
 #include <agent_bridge.h>
-
-const char* WIFI_SSID     = "your-wifi-ssid";
-const char* WIFI_PASSWORD = "your-wifi-password";
+// No WiFi.h needed — SDK handles WiFi provisioning and connection.
 // No gateway URL needed — discovered automatically via mDNS.
 
 const int LED_PIN = 2;
@@ -76,16 +73,16 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) { delay(500); }
-    Serial.printf("Connected: %s\n", WiFi.localIP().toString().c_str());
-
     // --- Build the manifest ---
+    // No WiFi setup needed — SDK handles provisioning via BLE.
+    // First boot: user scans QR code, sends WiFi creds from phone.
+    // Subsequent boots: stored credentials used automatically.
     static ahp_config_t config = {};
     config.device_id = "esp32-blink-01";
     config.label = "ESP32 Blink";
     config.firmware = "1.0.0";
-    config.gateway_url = NULL;  // Auto-discover gateway via mDNS
+    config.gateway_url = NULL;   // Auto-discover gateway via mDNS
+    config.wifi_mode = AHP_WIFI_AUTO;  // BLE provisioning if no stored creds
     config.on_read = on_read;
     config.on_write = on_write;
     config.on_invoke = on_invoke;

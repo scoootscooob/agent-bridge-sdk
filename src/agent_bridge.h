@@ -240,18 +240,54 @@ typedef struct {
 
     /** Reconnect interval in ms (default: 5000). */
     uint32_t reconnect_ms;
+
+    /**
+     * WiFi provisioning mode. Default: AHP_WIFI_AUTO.
+     * AHP_WIFI_AUTO — use stored credentials if available, otherwise start BLE provisioning.
+     * AHP_WIFI_PROVISION — always start BLE provisioning (factory reset flow).
+     * AHP_WIFI_MANUAL — caller handles WiFi (call WiFi.begin() yourself before ahp_begin).
+     */
+    uint8_t wifi_mode;
+
+    /**
+     * WiFi provisioning pop (proof of possession) string.
+     * Printed on the device label / QR code. Prevents neighbors from provisioning your device.
+     * Default: "abcdf1234" if not set.
+     */
+    const char* wifi_pop;
 } ahp_config_t;
+
+#define AHP_WIFI_AUTO      0
+#define AHP_WIFI_PROVISION 1
+#define AHP_WIFI_MANUAL    2
 
 // ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize and start the AHP session.
- * Call once in setup() after WiFi is connected.
- * Sends ahp.hello with the manifest and waits for ahp.hello.ok.
+ * Initialize the AHP device.
+ *
+ * If wifi_mode is AHP_WIFI_AUTO (default):
+ *   - Tries stored WiFi credentials first
+ *   - If no stored credentials, starts BLE provisioning
+ *   - User scans QR code with ESP provisioning app, sends WiFi credentials
+ *   - Once connected, discovers gateway via mDNS and starts AHP session
+ *
+ * If wifi_mode is AHP_WIFI_MANUAL:
+ *   - Caller must connect WiFi before calling ahp_begin()
+ *   - SDK skips provisioning and goes straight to gateway discovery
+ *
+ * Call once in setup().
  */
 void ahp_begin(const ahp_config_t* config);
+
+/**
+ * Generate a provisioning QR code payload string.
+ * Encode this as a QR code on the device packaging.
+ * Format: {"ver":"v1","name":"<device_id>","pop":"<pop>","transport":"ble"}
+ */
+const char* ahp_provisioning_qr_payload(const ahp_config_t* config);
 
 /**
  * Process messages and maintain connection.

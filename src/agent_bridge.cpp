@@ -18,7 +18,10 @@
 #include "agent_bridge.h"
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include <WebSocketsClient.h>
+#include <WiFi.h>
+#include <WiFiProv.h>
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -390,8 +393,127 @@ static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 // ---------------------------------------------------------------------------
+// WiFi provisioning
+// ---------------------------------------------------------------------------
+
+static const char* AHP_DEFAULT_POP = "abcdf1234";
+static volatile bool _wifi_connected = false;
+static volatile bool _prov_started = false;
+
+// QR code payload buffer (static, returned by ahp_provisioning_qr_payload)
+static char _qr_payload[256] = {0};
+
+static void wifi_prov_event(arduino_event_t* sys_event, arduino_event_info_t info) {
+    (void)info;
+    switch (sys_event->event_id) {
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            _wifi_connected = true;
+            Serial.printf("[AHP] WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            _wifi_connected = false;
+            break;
+        case ARDUINO_EVENT_PROV_START:
+            _prov_started = true;
+            Serial.println("[AHP] Provisioning started — use ESP provisioning app to send WiFi credentials.");
+            break;
+        case ARDUINO_EVENT_PROV_CRED_RECV:
+            Serial.println("[AHP] WiFi credentials received.");
+            break;
+        case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+            Serial.println("[AHP] Provisioning successful.");
+            break;
+        case ARDUINO_EVENT_PROV_CRED_FAIL:
+            Serial.println("[AHP] Provisioning failed. Retrying...");
+            break;
+        case ARDUINO_EVENT_PROV_END:
+            _prov_started = false;
+            break;
+        default:
+            break;
+    }
+}
+
+static bool has_stored_wifi_credentials(void) {
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString("ssid", "");
+    prefs.end();
+    return ssid.length() > 0;
+}
+
+static bool try_stored_wifi(uint32_t timeout_ms) {
+    Preferences prefs;
+    prefs.begin("wifi", true);
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+
+    if (ssid.length() == 0) return false;
+
+    Serial.printf("[AHP] Connecting to stored WiFi: %s\n", ssid.c_str());
+    WiFi.begin(ssid.c_str(), pass.c_str());
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeout_ms) {
+        delay(100);
+    }
+    _wifi_connected = (WiFi.status() == WL_CONNECTED);
+    if (_wifi_connected) {
+        Serial.printf("[AHP] Connected: %s\n", WiFi.localIP().toString().c_str());
+    }
+    return _wifi_connected;
+}
+
+static void start_ble_provisioning(const ahp_config_t* config) {
+    const char* device_name = config->device_id ? config->device_id : "ahp-device";
+    const char* pop = config->wifi_pop ? config->wifi_pop : AHP_DEFAULT_POP;
+
+    WiFi.onEvent(wifi_prov_event);
+    WiFiProv.beginProvision(
+        WIFI_PROV_SCHEME_BLE,
+        WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
+        WIFI_PROV_SECURITY_1,
+        pop,
+        device_name
+    );
+
+    Serial.printf("[AHP] BLE provisioning started as \"%s\" (pop: \"%s\")\n", device_name, pop);
+    Serial.printf("[AHP] QR payload: %s\n", ahp_provisioning_qr_payload(config));
+}
+
+static void ensure_wifi(const ahp_config_t* config) {
+    if (config->wifi_mode == AHP_WIFI_MANUAL) {
+        // Caller handles WiFi.
+        _wifi_connected = (WiFi.status() == WL_CONNECTED);
+        return;
+    }
+
+    if (config->wifi_mode == AHP_WIFI_PROVISION) {
+        // Force provisioning (factory reset flow).
+        start_ble_provisioning(config);
+        return;
+    }
+
+    // AHP_WIFI_AUTO: try stored creds, fall back to provisioning.
+    if (try_stored_wifi(10000)) {
+        return;
+    }
+    start_ble_provisioning(config);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+const char* ahp_provisioning_qr_payload(const ahp_config_t* config) {
+    const char* device_name = config->device_id ? config->device_id : "ahp-device";
+    const char* pop = config->wifi_pop ? config->wifi_pop : AHP_DEFAULT_POP;
+    snprintf(_qr_payload, sizeof(_qr_payload),
+        "{\"ver\":\"v1\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"ble\"}",
+        device_name, pop);
+    return _qr_payload;
+}
 
 // ---------------------------------------------------------------------------
 // mDNS gateway discovery
@@ -473,22 +595,28 @@ void ahp_begin(const ahp_config_t* config) {
     _config = config;
     _connected = false;
     _handshake_done = false;
+    _wifi_connected = false;
     _msg_id = 1;
     _event_seq = 0;
     _event_tracker_count = 0;
 
-    if (config->gateway_url) {
-        // Explicit URL provided — connect directly.
-        connect_ws(config->gateway_url, config->token, config->reconnect_ms);
-    } else {
-        // No URL — discover gateway via mDNS.
-        String host;
-        uint16_t port;
-        if (discover_gateway(config, host, port)) {
-            String url = "ws://" + host + ":" + String(port) + "/ahp";
-            connect_ws(url.c_str(), config->token, config->reconnect_ms);
+    // Step 1: Ensure WiFi is connected (provisioning if needed).
+    ensure_wifi(config);
+
+    // Step 2: If WiFi is already up, connect to gateway.
+    // If still provisioning (BLE), ahp_loop() handles the rest.
+    if (_wifi_connected) {
+        if (config->gateway_url) {
+            connect_ws(config->gateway_url, config->token, config->reconnect_ms);
         } else {
-            Serial.println("[AHP] Gateway not found. Will retry in ahp_loop().");
+            String host;
+            uint16_t port;
+            if (discover_gateway(config, host, port)) {
+                String url = "ws://" + host + ":" + String(port) + "/ahp";
+                connect_ws(url.c_str(), config->token, config->reconnect_ms);
+            } else {
+                Serial.println("[AHP] Gateway not found. Will retry in ahp_loop().");
+            }
         }
     }
 }
@@ -497,8 +625,27 @@ static uint32_t _last_mdns_retry = 0;
 static const uint32_t MDNS_RETRY_INTERVAL_MS = 10000;
 
 void ahp_loop(void) {
-    // If no gateway URL was provided and we haven't connected yet,
-    // periodically retry mDNS discovery.
+    // Stage 1: Still waiting for WiFi (BLE provisioning in progress).
+    if (!_wifi_connected) {
+        _wifi_connected = (WiFi.status() == WL_CONNECTED);
+        if (!_wifi_connected) return;
+
+        // WiFi just connected — save credentials for next boot.
+        Preferences prefs;
+        prefs.begin("wifi", false);
+        prefs.putString("ssid", WiFi.SSID());
+        prefs.putString("pass", WiFi.psk());
+        prefs.end();
+        Serial.println("[AHP] WiFi credentials saved.");
+
+        // Now try to connect to gateway.
+        if (_config->gateway_url) {
+            connect_ws(_config->gateway_url, _config->token, _config->reconnect_ms);
+        }
+        // If no URL, fall through to mDNS discovery below.
+    }
+
+    // Stage 2: WiFi up but no gateway connection yet — retry mDNS.
     if (!_config->gateway_url && !_connected && !_handshake_done) {
         uint32_t now = millis();
         if (now - _last_mdns_retry >= MDNS_RETRY_INTERVAL_MS) {
@@ -510,8 +657,10 @@ void ahp_loop(void) {
                 connect_ws(url.c_str(), _config->token, _config->reconnect_ms);
             }
         }
-        return;
+        if (!_connected) return;
     }
+
+    // Stage 3: Connected — process WebSocket messages.
     _ws.loop();
 }
 
