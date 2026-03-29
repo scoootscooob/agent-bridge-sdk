@@ -20,7 +20,6 @@
 
 const char* WIFI_SSID     = "your-wifi-ssid";
 const char* WIFI_PASSWORD = "your-wifi-password";
-const char* GATEWAY_URL   = "ws://192.168.1.100:18789/ahp";
 
 static float current_temp = 22.0;
 static unsigned long last_read_ms = 0;
@@ -62,7 +61,7 @@ void setup() {
     config.device_id = "esp32-sensor-01";
     config.label = "ESP32 Temperature Sensor";
     config.firmware = "1.0.0";
-    config.gateway_url = GATEWAY_URL;
+    config.gateway_url = NULL;  // Auto-discover gateway via mDNS
     config.on_read = on_read;
 
     ahp_resource_t* sensor = &config.manifest.resources[0];

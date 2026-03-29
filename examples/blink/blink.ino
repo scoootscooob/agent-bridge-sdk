@@ -18,7 +18,7 @@
 
 const char* WIFI_SSID     = "your-wifi-ssid";
 const char* WIFI_PASSWORD = "your-wifi-password";
-const char* GATEWAY_URL   = "ws://192.168.1.100:18789/ahp";
+// No gateway URL needed — discovered automatically via mDNS.
 
 const int LED_PIN = 2;
 static bool led_on = false;
@@ -85,7 +85,7 @@ void setup() {
     config.device_id = "esp32-blink-01";
     config.label = "ESP32 Blink";
     config.firmware = "1.0.0";
-    config.gateway_url = GATEWAY_URL;
+    config.gateway_url = NULL;  // Auto-discover gateway via mDNS
     config.on_read = on_read;
     config.on_write = on_write;
     config.on_invoke = on_invoke;

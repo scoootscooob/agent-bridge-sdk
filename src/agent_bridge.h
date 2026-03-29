@@ -215,10 +215,18 @@ typedef struct {
     /** Firmware version string. */
     const char* firmware;
 
-    /** Transport: gateway WebSocket URL, e.g. "ws://192.168.1.100:18789/ahp" */
+    /**
+     * Gateway WebSocket URL, e.g. "ws://192.168.1.100:18789/ahp".
+     * If NULL, the SDK discovers the gateway via mDNS (_openclaw._tcp).
+     */
     const char* gateway_url;
     /** Auth token (NULL if not required). */
     const char* token;
+    /**
+     * mDNS service type to scan for when gateway_url is NULL.
+     * Default: "_openclaw._tcp" if not set.
+     */
+    const char* mdns_service;
 
     /** Device manifest. */
     ahp_manifest_t manifest;

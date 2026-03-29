@@ -17,6 +17,7 @@
 
 #include "agent_bridge.h"
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include <WebSocketsClient.h>
 
 // ---------------------------------------------------------------------------
@@ -392,15 +393,52 @@ static void ws_event(WStype_t type, uint8_t* payload, size_t length) {
 // Public API
 // ---------------------------------------------------------------------------
 
-void ahp_begin(const ahp_config_t* config) {
-    _config = config;
-    _connected = false;
-    _handshake_done = false;
-    _msg_id = 1;
-    _event_seq = 0;
-    _event_tracker_count = 0;
+// ---------------------------------------------------------------------------
+// mDNS gateway discovery
+// ---------------------------------------------------------------------------
 
-    String url = String(config->gateway_url);
+static const char* AHP_DEFAULT_MDNS_SERVICE = "_openclaw._tcp";
+
+static bool discover_gateway(const ahp_config_t* config, String& out_host, uint16_t& out_port) {
+    const char* service = config->mdns_service ? config->mdns_service : AHP_DEFAULT_MDNS_SERVICE;
+
+    // Parse service type: "_openclaw._tcp" → type="_openclaw", proto="tcp"
+    String svc = String(service);
+    String proto = "tcp";
+    int dot = svc.lastIndexOf("._");
+    if (dot > 0) {
+        proto = svc.substring(dot + 2);
+        svc = svc.substring(0, dot);
+    }
+    // Strip leading underscore for MDNS.queryService
+    if (svc.startsWith("_")) svc = svc.substring(1);
+    if (proto.startsWith("_")) proto = proto.substring(1);
+
+    if (!MDNS.begin(config->device_id ? config->device_id : "ahp-device")) {
+        return false;
+    }
+
+    Serial.printf("[AHP] Scanning mDNS for %s._%s.local ...\n", svc.c_str(), proto.c_str());
+    int found = MDNS.queryService(svc.c_str(), proto.c_str());
+    if (found <= 0) {
+        Serial.println("[AHP] No gateway found via mDNS.");
+        MDNS.end();
+        return false;
+    }
+
+    out_host = MDNS.IP(0).toString();
+    out_port = MDNS.port(0);
+    Serial.printf("[AHP] Found gateway at %s:%d\n", out_host.c_str(), out_port);
+    MDNS.end();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Connection setup (URL parsing or mDNS discovery)
+// ---------------------------------------------------------------------------
+
+static void connect_ws(const char* gateway_url, const char* token, uint32_t reconnect_ms) {
+    String url = String(gateway_url);
     bool use_ssl = url.startsWith("wss://");
     if (url.startsWith("ws://")) url = url.substring(5);
     else if (use_ssl) url = url.substring(6);
@@ -423,15 +461,57 @@ void ahp_begin(const ahp_config_t* config) {
 
     _ws.begin(host.c_str(), port, path.c_str());
     _ws.onEvent(ws_event);
-    _ws.setReconnectInterval(config->reconnect_ms > 0 ? config->reconnect_ms : 5000);
+    _ws.setReconnectInterval(reconnect_ms > 0 ? reconnect_ms : 5000);
 
-    if (config->token) {
-        String auth = String("Bearer ") + config->token;
+    if (token) {
+        String auth = String("Bearer ") + token;
         _ws.setExtraHeaders(("Authorization: " + auth).c_str());
     }
 }
 
+void ahp_begin(const ahp_config_t* config) {
+    _config = config;
+    _connected = false;
+    _handshake_done = false;
+    _msg_id = 1;
+    _event_seq = 0;
+    _event_tracker_count = 0;
+
+    if (config->gateway_url) {
+        // Explicit URL provided — connect directly.
+        connect_ws(config->gateway_url, config->token, config->reconnect_ms);
+    } else {
+        // No URL — discover gateway via mDNS.
+        String host;
+        uint16_t port;
+        if (discover_gateway(config, host, port)) {
+            String url = "ws://" + host + ":" + String(port) + "/ahp";
+            connect_ws(url.c_str(), config->token, config->reconnect_ms);
+        } else {
+            Serial.println("[AHP] Gateway not found. Will retry in ahp_loop().");
+        }
+    }
+}
+
+static uint32_t _last_mdns_retry = 0;
+static const uint32_t MDNS_RETRY_INTERVAL_MS = 10000;
+
 void ahp_loop(void) {
+    // If no gateway URL was provided and we haven't connected yet,
+    // periodically retry mDNS discovery.
+    if (!_config->gateway_url && !_connected && !_handshake_done) {
+        uint32_t now = millis();
+        if (now - _last_mdns_retry >= MDNS_RETRY_INTERVAL_MS) {
+            _last_mdns_retry = now;
+            String host;
+            uint16_t port;
+            if (discover_gateway(_config, host, port)) {
+                String url = "ws://" + host + ":" + String(port) + "/ahp";
+                connect_ws(url.c_str(), _config->token, _config->reconnect_ms);
+            }
+        }
+        return;
+    }
     _ws.loop();
 }
 
