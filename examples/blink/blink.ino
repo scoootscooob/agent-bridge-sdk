@@ -1,8 +1,14 @@
 /**
- * Agent Bridge SDK — Blink Example
+ * Agent Hardware Protocol — Blink Example
  *
- * The simplest agent-native device: one LED, two actions (turn_on, turn_off).
- * Any AI agent that speaks the bridge protocol can discover and control it.
+ * The simplest agent-native device: one LED with typed properties and commands.
+ * Any AI agent that speaks AHP can discover and control it.
+ *
+ * The LED has:
+ *   - Property "on" (boolean, observable, writable) — read/write power state
+ *   - Command "turn_on" (idempotent) — turn the LED on
+ *   - Command "turn_off" (idempotent) — turn the LED off
+ *   - Command "toggle" — flip the current state
  *
  * Wiring: LED on GPIO 2 (built-in on most ESP32 boards).
  */
@@ -12,31 +18,57 @@
 
 const char* WIFI_SSID     = "your-wifi-ssid";
 const char* WIFI_PASSWORD = "your-wifi-password";
-const char* GATEWAY_URL   = "ws://192.168.1.100:18789";
+const char* GATEWAY_URL   = "ws://192.168.1.100:18789/ahp";
 
 const int LED_PIN = 2;
 static bool led_on = false;
 
-bool on_get(const char* resource_id, ab_state_t* out_state) {
-    if (strcmp(resource_id, "led") != 0) return false;
-    strncpy(out_state->value, led_on ? "on" : "off", AB_MAX_VALUE_LEN);
-    return true;
+// --- Property read callback ---
+ahp_read_result_t on_read(const char* resource_id, const char* property_id) {
+    ahp_read_result_t result = { .ok = false };
+    if (strcmp(resource_id, "led") != 0) return result;
+    if (strcmp(property_id, "on") == 0) {
+        strncpy(result.value_json, led_on ? "true" : "false", AHP_MAX_VALUE_LEN);
+        result.ok = true;
+    }
+    return result;
 }
 
-bool on_set(const char* resource_id, const char* action, const char* input_json, ab_state_t* out_state) {
-    if (strcmp(resource_id, "led") != 0) return false;
-    if (strcmp(action, "turn_on") == 0) {
-        led_on = true;
-        digitalWrite(LED_PIN, HIGH);
-    } else if (strcmp(action, "turn_off") == 0) {
-        led_on = false;
-        digitalWrite(LED_PIN, LOW);
-    } else {
-        return false;
+// --- Property write callback ---
+ahp_write_result_t on_write(const char* resource_id, const char* property_id, const char* value_json) {
+    ahp_write_result_t result = { .ok = false };
+    if (strcmp(resource_id, "led") != 0) return result;
+    if (strcmp(property_id, "on") == 0) {
+        led_on = (strcmp(value_json, "true") == 0);
+        digitalWrite(LED_PIN, led_on ? HIGH : LOW);
+        strncpy(result.value_json, led_on ? "true" : "false", AHP_MAX_VALUE_LEN);
+        result.ok = true;
+        // Push the state change to the host
+        ahp_push_property("led", "on", led_on ? "true" : "false");
     }
-    strncpy(out_state->value, led_on ? "on" : "off", AB_MAX_VALUE_LEN);
-    ab_push_state("led", led_on ? "on" : "off");
-    return true;
+    return result;
+}
+
+// --- Command invoke callback ---
+ahp_invoke_result_t on_invoke(const char* resource_id, const char* command_id, const char* input_json) {
+    ahp_invoke_result_t result = { .ok = false };
+    if (strcmp(resource_id, "led") != 0) return result;
+
+    if (strcmp(command_id, "turn_on") == 0) {
+        led_on = true;
+    } else if (strcmp(command_id, "turn_off") == 0) {
+        led_on = false;
+    } else if (strcmp(command_id, "toggle") == 0) {
+        led_on = !led_on;
+    } else {
+        return result;
+    }
+
+    digitalWrite(LED_PIN, led_on ? HIGH : LOW);
+    result.ok = true;
+    // Push the state change
+    ahp_push_property("led", "on", led_on ? "true" : "false");
+    return result;
 }
 
 void setup() {
@@ -48,29 +80,55 @@ void setup() {
     while (WiFi.status() != WL_CONNECTED) { delay(500); }
     Serial.printf("Connected: %s\n", WiFi.localIP().toString().c_str());
 
-    static ab_config_t config = {};
+    // --- Build the manifest ---
+    static ahp_config_t config = {};
+    config.device_id = "esp32-blink-01";
+    config.label = "ESP32 Blink";
+    config.firmware = "1.0.0";
     config.gateway_url = GATEWAY_URL;
-    config.on_get = on_get;
-    config.on_set = on_set;
+    config.on_read = on_read;
+    config.on_write = on_write;
+    config.on_invoke = on_invoke;
 
-    strncpy(config.manifest.label, "ESP32 Blink", AB_MAX_NAME_LEN);
-    strncpy(config.manifest.firmware_version, "0.1.0", 32);
+    // One resource: the LED
+    ahp_resource_t* led = &config.manifest.resources[0];
     config.manifest.resource_count = 1;
+    strncpy(led->id, "led", AHP_MAX_ID_LEN);
+    strncpy(led->type, "light", AHP_MAX_TYPE_LEN);
+    strncpy(led->label, "Built-in LED", AHP_MAX_LABEL_LEN);
+    strncpy(led->description, "On-board LED, can be toggled on and off", AHP_MAX_DESC_LEN);
 
-    ab_resource_t* led = &config.manifest.resources[0];
-    strncpy(led->id, "led", AB_MAX_ID_LEN);
-    strncpy(led->name, "Built-in LED", AB_MAX_NAME_LEN);
-    strncpy(led->type, "light", AB_MAX_TYPE_LEN);
-    strncpy(led->state.value, "off", AB_MAX_VALUE_LEN);
-    led->action_count = 2;
-    strncpy(led->actions[0].id, "turn_on", AB_MAX_ID_LEN);
-    strncpy(led->actions[0].label, "Turn On", AB_MAX_NAME_LEN);
-    strncpy(led->actions[1].id, "turn_off", AB_MAX_ID_LEN);
-    strncpy(led->actions[1].label, "Turn Off", AB_MAX_NAME_LEN);
+    // One property: "on" (boolean, observable, writable)
+    led->property_count = 1;
+    ahp_property_def_t* prop = &led->properties[0];
+    strncpy(prop->id, "on", AHP_MAX_ID_LEN);
+    prop->type = AHP_TYPE_BOOLEAN;
+    strncpy(prop->label, "Power", AHP_MAX_LABEL_LEN);
+    prop->observable = true;
+    prop->writable = true;
 
-    ab_begin(&config);
+    // Three commands
+    led->command_count = 3;
+    ahp_command_def_t* c;
+
+    c = &led->commands[0];
+    strncpy(c->id, "turn_on", AHP_MAX_ID_LEN);
+    strncpy(c->label, "Turn on", AHP_MAX_LABEL_LEN);
+    c->idempotent = true;
+
+    c = &led->commands[1];
+    strncpy(c->id, "turn_off", AHP_MAX_ID_LEN);
+    strncpy(c->label, "Turn off", AHP_MAX_LABEL_LEN);
+    c->idempotent = true;
+
+    c = &led->commands[2];
+    strncpy(c->id, "toggle", AHP_MAX_ID_LEN);
+    strncpy(c->label, "Toggle", AHP_MAX_LABEL_LEN);
+    strncpy(c->description, "Flip the LED state", AHP_MAX_DESC_LEN);
+
+    ahp_begin(&config);
 }
 
 void loop() {
-    ab_loop();
+    ahp_loop();
 }
